@@ -1,0 +1,1073 @@
+import asyncio
+import base64
+import hashlib
+import io
+import secrets
+from datetime import datetime, timedelta, timezone
+
+import aiosqlite
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import (CallbackQuery, InlineKeyboardButton,
+                           InlineKeyboardMarkup, KeyboardButton, Message,
+                           ReplyKeyboardMarkup, ReplyKeyboardRemove)
+from openai import AsyncOpenAI
+
+# ================== CONFIG ==================
+BOT_TOKEN = "-"
+OPENAI_API_KEY = "8844468862:AAHKhkkwm1nSwrZwcVd9J5LKBiCDZbDpzvk"
+ADMIN_ID = 7981528969
+ADMIN_USERNAME = "WorkSaturn17940"          # без @
+DB_PATH = "bot.db"
+MSK = timezone(timedelta(hours=3))
+
+# Стоимость в токенах
+COST_MATH = 5
+COST_MATH_PHOTO = 8
+COST_ESSAY = 10
+COST_TRANSLATE = 5
+# Транслит — БЕСПЛАТНО
+
+DEFAULT_TOKEN_LIMIT = 300
+INF_DATE = datetime(9999, 12, 31, tzinfo=timezone.utc)
+
+# ================== INIT ==================
+bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher()
+router = Router()
+dp.include_router(router)
+gpt = AsyncOpenAI(api_key=OPENAI_API_KEY)
+
+# ================== DB ==================
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            tg_id INTEGER PRIMARY KEY,
+            username TEXT,
+            hwid TEXT UNIQUE,
+            license_until TEXT,
+            blocked_until TEXT,
+            block_reason TEXT,
+            tokens INTEGER DEFAULT 300,
+            token_limit INTEGER DEFAULT 300,
+            token_limit_until TEXT,
+            last_reset TEXT,
+            created_at TEXT
+        )""")
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS keys (
+            key TEXT PRIMARY KEY,
+            activations_left INTEGER,
+            duration_hours INTEGER,
+            created_at TEXT
+        )""")
+        await db.commit()
+
+
+async def db_exec(q, p=()):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(q, p)
+        await db.commit()
+
+
+async def db_fetch(q, p=()):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(q, p) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+
+async def db_fetchall(q, p=()):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(q, p) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+
+# ================== HELPERS ==================
+def is_admin(user) -> bool:
+    uname = (user.username or "").lower().lstrip("@")
+    return user.id == ADMIN_ID and uname == ADMIN_USERNAME.lower()
+
+
+def generate_hwid(tg_id: int) -> str:
+    return hashlib.sha256(f"{tg_id}-{secrets.token_hex(16)}".encode()).hexdigest()[:16]
+
+
+def gen_key() -> str:
+    return "KEY-" + "".join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(16))
+
+
+def parse_dt(s):
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
+
+
+def license_active(user) -> bool:
+    dt = parse_dt(user.get("license_until"))
+    return bool(dt and dt > datetime.now(timezone.utc))
+
+
+def is_blocked(user):
+    dt = parse_dt(user.get("blocked_until"))
+    if not dt:
+        return False
+    return dt > datetime.now(timezone.utc)
+
+
+async def get_user(tg_id):
+    return await db_fetch("SELECT * FROM users WHERE tg_id=?", (tg_id,))
+
+
+async def get_user_by_hwid(hwid):
+    return await db_fetch("SELECT * FROM users WHERE hwid=?", (hwid,))
+
+
+async def ensure_user(msg: Message):
+    """Создаёт/обновляет пользователя. Возвращает (user, is_admin_flag)."""
+    u = await get_user(msg.from_user.id)
+    if not u:
+        hwid = generate_hwid(msg.from_user.id)
+        await db_exec(
+            "INSERT INTO users(tg_id, username, hwid, tokens, token_limit, created_at, last_reset) VALUES(?,?,?,?,?,?,?)",
+            (msg.from_user.id, msg.from_user.username or "", hwid,
+             DEFAULT_TOKEN_LIMIT, DEFAULT_TOKEN_LIMIT,
+             datetime.now(timezone.utc).isoformat(),
+             datetime.now(MSK).date().isoformat()),
+        )
+        u = await get_user(msg.from_user.id)
+    # update username
+    if (u["username"] or "") != (msg.from_user.username or ""):
+        await db_exec("UPDATE users SET username=? WHERE tg_id=?",
+                      (msg.from_user.username or "", msg.from_user.id))
+        u["username"] = msg.from_user.username or ""
+    return u, is_admin(msg.from_user)
+
+
+async def check_access(msg: Message) -> bool:
+    """Проверка блокировки/лицензии. Если нет доступа — пишет сообщение и возвращает False."""
+    u = await get_user(msg.from_user.id)
+    if not u:
+        return True
+    if is_blocked(u):
+        dt = parse_dt(u["blocked_until"])
+        until = "навсегда" if dt and dt.year >= 9999 else dt.strftime("%d.%m.%Y %H:%M МСК")
+        await msg.answer(
+            f"🚫 <b>Вы заблокированы.</b>\n"
+            f"Причина: {u.get('block_reason') or '—'}\n"
+            f"До: {until}"
+        )
+        return False
+    if is_admin(msg.from_user):
+        return True
+    if not license_active(u):
+        await msg.answer(
+            "⏰ <b>Ваш ключ закончился.</b>\nВведите новый ключ для продолжения работы.\n\n"
+            "Просто отправьте ключ сообщением."
+        )
+        return False
+    return True
+
+
+def main_menu_kb(admin=False):
+    kb = [
+        [KeyboardButton(text="🧮 Решить пример")],
+        [KeyboardButton(text="✍️ Сочинение"), KeyboardButton(text="🌐 Переводчик")],
+        [KeyboardButton(text="🔤 Транслит")],
+    ]
+    if admin:
+        kb.append([KeyboardButton(text="⚙️ Админ-панель")])
+    return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+
+
+def back_kb():
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="🔙 Назад")]], resize_keyboard=True
+    )
+
+
+async def ask_ai(system: str, user_text: str) -> str:
+    r = await gpt.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_text},
+        ],
+        temperature=0.4,
+    )
+    return r.choices[0].message.content
+
+
+async def ask_ai_vision(system: str, prompt: str, image_bytes: bytes) -> str:
+    b64 = base64.b64encode(image_bytes).decode()
+    r = await gpt.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": system},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url",
+                     "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                ],
+            },
+        ],
+        temperature=0.3,
+    )
+    return r.choices[0].message.content
+
+
+async def download_photo(msg: Message) -> bytes:
+    file = await bot.get_file(msg.photo[-1].file_id)
+    buf = io.BytesIO()
+    await bot.download_file(file.file_path, buf)
+    return buf.getvalue()
+
+
+async def charge_tokens(msg: Message, cost: int) -> bool:
+    """Списывает токены. False — если не хватило."""
+    u = await get_user(msg.from_user.id)
+    if not u:
+        return True
+    if is_admin(msg.from_user):
+        return True
+    if u["tokens"] < cost:
+        await msg.answer(
+            "💸 <b>Ваши токены закончились.</b>\n"
+            f"Нужно: {cost}, у вас: {u['tokens']}.\n"
+            "Они обновятся завтра в 00:00 МСК. Ожидайте."
+        )
+        return False
+    new = u["tokens"] - cost
+    await db_exec("UPDATE users SET tokens=? WHERE tg_id=?", (new, msg.from_user.id))
+    u["tokens"] = new
+    return True
+
+
+async def show_balance(msg: Message, cost: int):
+    u = await get_user(msg.from_user.id)
+    if not u or is_admin(msg.from_user):
+        return
+    await msg.answer(
+        f"<i>Списано {cost} токенов. Осталось {u['tokens']}/{u['token_limit']}.</i>"
+    )
+
+
+# ================== FSM ==================
+class S(StatesGroup):
+    # auth
+    key_input = State()
+    # math
+    math_wait = State()
+    math_confirm = State()
+    # essay
+    essay_topic = State()
+    essay_sentences = State()
+    essay_style = State()
+    # translate
+    tr_input = State()
+    tr_target = State()
+    # translit
+    tl_input = State()
+    # admin
+    a_key_act = State()
+    a_key_dur = State()
+    a_hours_hwid = State()
+    a_hours_act = State()
+    a_hours_amt = State()
+    a_del_hwid = State()
+    a_block_hwid = State()
+    a_block_dur = State()
+    a_block_reason = State()
+    a_unblock_hwid = State()
+    a_tokens_hwid = State()
+    a_tokens_act = State()
+    a_tokens_amt = State()
+    a_tokens_days = State()
+    a_limit_hwid = State()
+    a_limit_amt = State()
+    a_limit_days = State()
+
+
+# ================== TRANSLIT ==================
+TR = {
+    'а':'a','б':'b','в':'v','г':'g','д':'d','е':'e','ё':'e','ж':'zh','з':'z',
+    'и':'i','й':'y','к':'k','л':'l','м':'m','н':'n','о':'o','п':'p','р':'r',
+    'с':'s','т':'t','у':'u','ф':'f','х':'kh','ц':'ts','ч':'ch','ш':'sh',
+    'щ':'shch','ъ':'','ы':'y','ь':'','э':'e','ю':'yu','я':'ya',
+    'А':'A','Б':'B','В':'V','Г':'G','Д':'D','Е':'E','Ё':'E','Ж':'Zh','З':'Z',
+    'И':'I','Й':'Y','К':'K','Л':'L','М':'M','Н':'N','О':'O','П':'P','Р':'R',
+    'С':'S','Т':'T','У':'U','Ф':'F','Х':'Kh','Ц':'Ts','Ч':'Ch','Ш':'Sh',
+    'Щ':'Shch','Ъ':'','Ы':'Y','Ь':'','Э':'E','Ю':'Yu','Я':'Ya',
+}
+
+
+def translit(text: str) -> str:
+    return "".join(TR.get(ch, ch) for ch in text)
+
+
+# ================== /start ==================
+@router.message(CommandStart())
+async def cmd_start(msg: Message, state: FSMContext):
+    await state.clear()
+    u, adm = await ensure_user(msg)
+
+    if is_blocked(u):
+        dt = parse_dt(u["blocked_until"])
+        until = "навсегда" if dt and dt.year >= 9999 else dt.strftime("%d.%m.%Y %H:%M МСК")
+        await msg.answer(
+            f"🚫 <b>Вы заблокированы.</b>\nПричина: {u.get('block_reason') or '—'}\nДо: {until}"
+        )
+        return
+
+    if adm:
+        await msg.answer("👑 Добро пожаловать, администратор!", reply_markup=main_menu_kb(True))
+        return
+
+    if not license_active(u):
+        await msg.answer(
+            "🔑 <b>Перед началом работы введите ключ активации.</b>\n\n"
+            "Если у вас нет ключа — обратитесь к администратору.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        await state.set_state(S.key_input)
+        return
+
+    await msg.answer("👋 Главное меню:", reply_markup=main_menu_kb(False))
+
+
+@router.message(Command("menu"))
+async def cmd_menu(msg: Message, state: FSMContext):
+    await state.clear()
+    await cmd_start(msg, state)
+
+
+# ================== KEY INPUT ==================
+@router.message(S.key_input)
+async def handle_key(msg: Message, state: FSMContext):
+    key = (msg.text or "").strip()
+    k = await db_fetch("SELECT * FROM keys WHERE key=?", (key,))
+    if not k or k["activations_left"] <= 0:
+        await msg.answer("❌ Неверный или исчерпанный ключ. Попробуйте другой.")
+        return
+
+    u = await get_user(msg.from_user.id)
+    now = datetime.now(timezone.utc)
+    cur = parse_dt(u["license_until"])
+    base = cur if (cur and cur > now) else now
+    new_until = base + timedelta(hours=k["duration_hours"])
+
+    await db_exec("UPDATE users SET license_until=? WHERE tg_id=?",
+                  (new_until.isoformat(), msg.from_user.id))
+    new_left = k["activations_left"] - 1
+    if new_left <= 0:
+        await db_exec("DELETE FROM keys WHERE key=?", (key,))
+    else:
+        await db_exec("UPDATE keys SET activations_left=? WHERE key=?", (new_left, key))
+
+    await state.clear()
+    await msg.answer(
+        f"✅ Ключ активирован!\nЛицензия до: {new_until.astimezone(MSK).strftime('%d.%m.%Y %H:%M МСК')}",
+        reply_markup=main_menu_kb(is_admin(msg.from_user)),
+    )
+
+
+# ================== MAIN MENU BUTTONS ==================
+@router.message(F.text == "🔙 Назад")
+async def back_handler(msg: Message, state: FSMContext):
+    await state.clear()
+    await msg.answer("🏠 Главное меню:", reply_markup=main_menu_kb(is_admin(msg.from_user)))
+
+
+@router.message(F.text == "🧮 Решить пример")
+async def btn_math(msg: Message, state: FSMContext):
+    if not await check_access(msg):
+        return
+    await state.set_state(S.math_wait)
+    await msg.answer(
+        "🧮 Отправьте пример <b>текстом</b> или <b>фото</b>.\n"
+        "Можно решать задачи, длинные примеры, дроби, проценты, остатки.",
+        reply_markup=back_kb(),
+    )
+
+
+@router.message(F.text == "✍️ Сочинение")
+async def btn_essay(msg: Message, state: FSMContext):
+    if not await check_access(msg):
+        return
+    await state.set_state(S.essay_topic)
+    await msg.answer("✍️ Введите тему сочинения:", reply_markup=back_kb())
+
+
+@router.message(F.text == "🌐 Переводчик")
+async def btn_tr(msg: Message, state: FSMContext):
+    if not await check_access(msg):
+        return
+    await state.set_state(S.tr_input)
+    await msg.answer(
+        "🌐 Отправьте текст или фото на любом языке — переведу.",
+        reply_markup=back_kb(),
+    )
+
+
+@router.message(F.text == "🔤 Транслит")
+async def btn_tl(msg: Message, state: FSMContext):
+    if not await check_access(msg):
+        return
+    await state.set_state(S.tl_input)
+    await msg.answer(
+        "🔤 Отправьте русский текст — переведу в транслит (привет → privet).\n"
+        "<i>Бесплатно.</i>",
+        reply_markup=back_kb(),
+    )
+
+
+@router.message(F.text == "⚙️ Админ-панель")
+async def btn_admin(msg: Message, state: FSMContext):
+    if not is_admin(msg.from_user):
+        return
+    await state.clear()
+    await msg.answer("⚙️ <b>Админ-панель</b>", reply_markup=admin_kb())
+
+
+# ================== MATH ==================
+MATH_SYS = (
+    "Ты — учитель математики. Решай примеры как школьный учитель на доске: подробно, по действиям, "
+    "с пояснением правил (порядок действий, скобки, умножение/деление до сложения/вычитания, дроби, "
+    "проценты, остаток от деления). Если это задача — оформи как 'Дано / Решение / Ответ'. "
+    "Пиши на русском, без LaTeX, обычным текстом."
+)
+
+VISION_EXTRACT = (
+    "Извлеки математическое выражение или текст задачи с картинки. "
+    "Верни ТОЛЬКО распознанный пример одной строкой, без решений. "
+    "Если распознать невозможно — верни ровно: НЕ РАСПОЗНАНО"
+)
+
+
+@router.message(S.math_wait, F.photo)
+async def math_photo(msg: Message, state: FSMContext):
+    if not await check_access(msg):
+        return
+    status = await msg.answer("🔍 Распознаю...")
+    try:
+        img = await download_photo(msg)
+        expr = (await ask_ai_vision(
+            "Ты OCR-модуль для математики.", VISION_EXTRACT, img
+        )).strip()
+    except Exception as e:
+        await status.edit_text(f"⚠️ Ошибка распознавания: {e}")
+        return
+
+    if not expr or "НЕ РАСПОЗНАНО" in expr.upper():
+        await status.edit_text("😕 Не смог разобрать. Пришлите более чёткое фото или введите текстом.")
+        return
+
+    await state.update_data(expr=expr)
+    await state.set_state(S.math_confirm)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да", callback_data="math_yes"),
+         InlineKeyboardButton(text="✏️ Изменить", callback_data="math_edit")],
+    ])
+    await status.edit_text(
+        f"👀 Я вижу:\n<code>{expr}</code>\n\nЭто верно?",
+        reply_markup=kb,
+    )
+
+
+@router.message(S.math_wait, F.text)
+async def math_text(msg: Message, state: FSMContext):
+    if not await check_access(msg):
+        return
+    if not await charge_tokens(msg, COST_MATH):
+        return
+    status = await msg.answer("🧠 Решаю...")
+    try:
+        ans = await ask_ai(MATH_SYS, msg.text)
+    except Exception as e:
+        await status.edit_text(f"⚠️ Ошибка: {e}")
+        return
+    await status.edit_text(f"📝 <b>Решение:</b>\n\n{ans}")
+    await show_balance(msg, COST_MATH)
+
+
+@router.callback_query(F.data == "math_yes", S.math_confirm)
+async def math_confirm_yes(cb: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    expr = data.get("expr", "")
+    if not await charge_tokens(cb.message, COST_MATH_PHOTO):
+        await state.clear()
+        return
+    await cb.message.edit_text("🧠 Решаю...")
+    try:
+        ans = await ask_ai(MATH_SYS, expr)
+    except Exception as e:
+        await cb.message.edit_text(f"⚠️ Ошибка: {e}")
+        return
+    await cb.message.edit_text(f"📝 <b>Решение:</b>\n\n{ans}")
+    await show_balance(cb.message, COST_MATH_PHOTO)
+    await state.clear()
+
+
+@router.callback_query(F.data == "math_edit", S.math_confirm)
+async def math_confirm_edit(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(S.math_wait)
+    await cb.message.edit_text("✏️ Пришлите новое фото или введите пример текстом.")
+    await cb.answer()
+
+
+# ================== ESSAY ==================
+@router.message(S.essay_topic, F.text)
+async def essay_topic(msg: Message, state: FSMContext):
+    if msg.text == "🔙 Назад":
+        return await back_handler(msg, state)
+    if not await check_access(msg):
+        return
+    await state.update_data(topic=msg.text)
+    await state.set_state(S.essay_sentences)
+    await msg.answer("Сколько предложений должно быть? (введите число)")
+
+
+@router.message(S.essay_sentences, F.text)
+async def essay_sentences(msg: Message, state: FSMContext):
+    if msg.text == "🔙 Назад":
+        return await back_handler(msg, state)
+    if not msg.text.isdigit() or not (1 <= int(msg.text) <= 200):
+        await msg.answer("❗ Введите число от 1 до 200.")
+        return
+    await state.update_data(n=int(msg.text))
+    await state.set_state(S.essay_style)
+    await msg.answer(
+        "Какой стиль?\n"
+        "<b>1</b> — умный (богатый литературный язык)\n"
+        "<b>2</b> — простой (обычные, живые слова)"
+    )
+
+
+@router.message(S.essay_style, F.text)
+async def essay_style(msg: Message, state: FSMContext):
+    if msg.text == "🔙 Назад":
+        return await back_handler(msg, state)
+    if msg.text not in ("1", "2"):
+        await msg.answer("Введите 1 или 2.")
+        return
+    if not await check_access(msg):
+        return
+
+    data = await state.get_data()
+    topic = data["topic"]
+    n = data["n"]
+    style = "литературный, богатый, с умными формулировками" if msg.text == "1" \
+        else "простой, естественный, как пишет обычный школьник"
+
+    if not await charge_tokens(msg, COST_ESSAY):
+        return
+
+    status = await msg.answer("✍️ Пишу...")
+    sys = (
+        "Ты пишешь школьные сочинения на русском языке. "
+        f"Стиль: {style}. Ровно {n} предложений. "
+        "Не используй LaTeX и markdown. Просто текст. "
+        "Не пиши 'вот сочинение' — сразу текст."
+    )
+    try:
+        text = await ask_ai(sys, f"Тема: {topic}")
+    except Exception as e:
+        await status.edit_text(f"⚠️ Ошибка: {e}")
+        return
+    await status.edit_text(f"📄 <b>Сочинение на тему «{topic}»:</b>\n\n{text}")
+    await show_balance(msg, COST_ESSAY)
+    await state.clear()
+
+
+# ================== TRANSLATE ==================
+@router.message(S.tr_input, F.photo)
+async def tr_photo(msg: Message, state: FSMContext):
+    if not await check_access(msg):
+        return
+    status = await msg.answer("🔍 Распознаю текст...")
+    try:
+        img = await download_photo(msg)
+        text = await ask_ai_vision(
+            "Ты OCR. Извлеки весь текст с картинки, верни только текст без пояснений.",
+            "Извлеки текст.", img,
+        )
+    except Exception as e:
+        await status.edit_text(f"⚠️ Ошибка: {e}")
+        return
+    await state.update_data(text=text)
+    await state.set_state(S.tr_target)
+    await status.edit_text(
+        f"📄 Распознано:\n<code>{text[:500]}</code>\n\nНа какой язык перевести?",
+        reply_markup=tr_target_kb(),
+    )
+
+
+@router.message(S.tr_input, F.text)
+async def tr_text(msg: Message, state: FSMContext):
+    if msg.text == "🔙 Назад":
+        return await back_handler(msg, state)
+    if not await check_access(msg):
+        return
+    await state.update_data(text=msg.text)
+    await state.set_state(S.tr_target)
+    await msg.answer("На какой язык перевести?", reply_markup=tr_target_kb())
+
+
+def tr_target_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🇷🇺 Русский", callback_data="tr:Русский"),
+         InlineKeyboardButton(text="🇬🇧 English", callback_data="tr:English")],
+        [InlineKeyboardButton(text="🇩🇪 Deutsch", callback_data="tr:Deutsch"),
+         InlineKeyboardButton(text="🇫🇷 Français", callback_data="tr:Français")],
+        [InlineKeyboardButton(text="🇪🇸 Español", callback_data="tr:Español"),
+         InlineKeyboardButton(text="🇨🇳 中文", callback_data="tr:Китайский")],
+    ])
+
+
+@router.callback_query(F.data.startswith("tr:"), S.tr_target)
+async def tr_do(cb: CallbackQuery, state: FSMContext):
+    target = cb.data.split(":", 1)[1]
+    data = await state.get_data()
+    text = data.get("text", "")
+
+    if not await charge_tokens(cb.message, COST_TRANSLATE):
+        await state.clear()
+        return
+
+    await cb.message.edit_text("🌐 Перевожу...")
+    try:
+        res = await ask_ai(
+            f"Ты профессиональный переводчик. Переведи текст на {target}. "
+            "Верни ТОЛЬКО перевод, без пояснений.",
+            text,
+        )
+    except Exception as e:
+        await cb.message.edit_text(f"⚠️ Ошибка: {e}")
+        return
+    await cb.message.edit_text(f"🌐 <b>{target}:</b>\n\n{res}")
+    await show_balance(cb.message, COST_TRANSLATE)
+    await state.clear()
+
+
+# ================== TRANSLIT ==================
+@router.message(S.tl_input, F.text)
+async def tl_do(msg: Message, state: FSMContext):
+    if msg.text == "🔙 Назад":
+        return await back_handler(msg, state)
+    if not await check_access(msg):
+        return
+    await msg.answer(f"🔤 <code>{translit(msg.text)}</code>\n\n<i>Бесплатно.</i>")
+
+
+# ================== ADMIN PANEL ==================
+def admin_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👥 Пользователи", callback_data="a:users")],
+        [InlineKeyboardButton(text="🔑 Управление ключами", callback_data="a:keys")],
+        [InlineKeyboardButton(text="⏱ Часы лицензии", callback_data="a:hours")],
+        [InlineKeyboardButton(text="🗑 Удалить лицензию", callback_data="a:dellic")],
+        [InlineKeyboardButton(text="🚫 Блок / Разблок", callback_data="a:block")],
+        [InlineKeyboardButton(text="💎 Токены", callback_data="a:tokens")],
+        [InlineKeyboardButton(text="📊 Лимит токенов", callback_data="a:limit")],
+    ])
+
+
+@router.callback_query(F.data == "a:users")
+async def a_users(cb: CallbackQuery):
+    if not is_admin(cb.from_user):
+        return
+    users = await db_fetchall("SELECT * FROM users ORDER BY created_at DESC")
+    if not users:
+        await cb.message.edit_text("Пусто.")
+        return
+    lines = ["<b>ID | @user | HWID | Лицензия | Токены | Блок</b>"]
+    for u in users[:80]:
+        lic = parse_dt(u["license_until"])
+        lic_s = lic.astimezone(MSK).strftime("%d.%m %H:%M") if lic else "нет"
+        blk = "да" if is_blocked(u) else "—"
+        lines.append(
+            f"<code>{u['tg_id']}</code> | @{u['username'] or '—'} | "
+            f"<code>{u['hwid']}</code> | {lic_s} | "
+            f"{u['tokens']}/{u['token_limit']} | {blk}"
+        )
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:4000] + "\n…"
+    await cb.message.edit_text(text, reply_markup=admin_kb())
+
+
+# -------- KEYS --------
+@router.callback_query(F.data == "a:keys")
+async def a_keys(cb: CallbackQuery):
+    if not is_admin(cb.from_user):
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Создать ключ", callback_data="a:key_gen")],
+        [InlineKeyboardButton(text="📋 Список ключей", callback_data="a:key_list")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="a:back")],
+    ])
+    await cb.message.edit_text("🔑 Управление ключами", reply_markup=kb)
+
+
+@router.callback_query(F.data == "a:key_gen")
+async def a_key_gen(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user):
+        return
+    await state.set_state(S.a_key_act)
+    await cb.message.edit_text("На сколько активаций? (число)")
+
+
+@router.message(S.a_key_act, F.text)
+async def a_key_act(msg: Message, state: FSMContext):
+    if not msg.text.isdigit() or int(msg.text) < 1:
+        await msg.answer("Введите положительное число.")
+        return
+    await state.update_data(act=int(msg.text))
+    await state.set_state(S.a_key_dur)
+    await msg.answer("На сколько часов даёт лицензию? (число)")
+
+
+@router.message(S.a_key_dur, F.text)
+async def a_key_dur(msg: Message, state: FSMContext):
+    if not msg.text.isdigit() or int(msg.text) < 1:
+        await msg.answer("Введите положительное число.")
+        return
+    d = await state.get_data()
+    key = gen_key()
+    await db_exec(
+        "INSERT INTO keys(key, activations_left, duration_hours, created_at) VALUES(?,?,?,?)",
+        (key, d["act"], int(msg.text), datetime.now(timezone.utc).isoformat()),
+    )
+    await state.clear()
+    await msg.answer(
+        f"✅ Ключ создан:\n<code>{key}</code>\n"
+        f"Активаций: {d['act']}\nЧасов: {msg.text}",
+        reply_markup=main_menu_kb(True),
+    )
+
+
+@router.callback_query(F.data == "a:key_list")
+async def a_key_list(cb: CallbackQuery):
+    if not is_admin(cb.from_user):
+        return
+    keys = await db_fetchall("SELECT * FROM keys ORDER BY created_at DESC")
+    if not keys:
+        await cb.message.edit_text("Ключей нет.", reply_markup=admin_kb())
+        return
+    txt = "\n".join(f"<code>{k['key']}</code> — {k['activations_left']} акт., {k['duration_hours']}ч"
+                    for k in keys[:50])
+    await cb.message.edit_text(f"🔑 Ключи:\n{txt}", reply_markup=admin_kb())
+
+
+# -------- HOURS --------
+@router.callback_query(F.data == "a:hours")
+async def a_hours(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user):
+        return
+    await state.set_state(S.a_hours_hwid)
+    await cb.message.edit_text("Введите HWID пользователя:")
+
+
+@router.message(S.a_hours_hwid, F.text)
+async def a_hours_hwid(msg: Message, state: FSMContext):
+    u = await get_user_by_hwid(msg.text.strip())
+    if not u:
+        await msg.answer("Пользователь с таким HWID не найден.")
+        return
+    await state.update_data(hwid=u["hwid"])
+    await state.set_state(S.a_hours_act)
+    await msg.answer("Что сделать? Напишите <b>+</b> (добавить) или <b>-</b> (убрать).")
+
+
+@router.message(S.a_hours_act, F.text)
+async def a_hours_act(msg: Message, state: FSMContext):
+    if msg.text.strip() not in ("+", "-"):
+        await msg.answer("Введите + или -")
+        return
+    await state.update_data(act=msg.text.strip())
+    await state.set_state(S.a_hours_amt)
+    await msg.answer("Сколько часов?")
+
+
+@router.message(S.a_hours_amt, F.text)
+async def a_hours_amt(msg: Message, state: FSMContext):
+    if not msg.text.isdigit():
+        await msg.answer("Введите число.")
+        return
+    d = await state.get_data()
+    u = await get_user_by_hwid(d["hwid"])
+    now = datetime.now(timezone.utc)
+    cur = parse_dt(u["license_until"]) or now
+    if cur < now:
+        cur = now
+    hours = int(msg.text)
+    new_dt = cur + timedelta(hours=hours) if d["act"] == "+" else cur - timedelta(hours=hours)
+    await db_exec("UPDATE users SET license_until=? WHERE hwid=?", (new_dt.isoformat(), d["hwid"]))
+    await state.clear()
+    await msg.answer(
+        f"✅ Обновлено. Лицензия до: {new_dt.astimezone(MSK).strftime('%d.%m.%Y %H:%M МСК')}",
+        reply_markup=main_menu_kb(True),
+    )
+
+
+# -------- DELETE LICENSE --------
+@router.callback_query(F.data == "a:dellic")
+async def a_dellic(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user):
+        return
+    await state.set_state(S.a_del_hwid)
+    await cb.message.edit_text("Введите HWID для удаления лицензии:")
+
+
+@router.message(S.a_del_hwid, F.text)
+async def a_del_do(msg: Message, state: FSMContext):
+    hwid = msg.text.strip()
+    u = await get_user_by_hwid(hwid)
+    if not u:
+        await msg.answer("Не найдено.")
+        return
+    await db_exec("UPDATE users SET license_until=NULL WHERE hwid=?", (hwid,))
+    await state.clear()
+    await msg.answer("🗑 Лицензия удалена.", reply_markup=main_menu_kb(True))
+
+
+# -------- BLOCK / UNBLOCK --------
+@router.callback_query(F.data == "a:block")
+async def a_block_menu(cb: CallbackQuery):
+    if not is_admin(cb.from_user):
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🚫 Заблокировать", callback_data="a:block_on")],
+        [InlineKeyboardButton(text="✅ Разблокировать", callback_data="a:block_off")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="a:back")],
+    ])
+    await cb.message.edit_text("Блокировка", reply_markup=kb)
+
+
+@router.callback_query(F.data == "a:block_on")
+async def a_block_on(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user):
+        return
+    await state.set_state(S.a_block_hwid)
+    await cb.message.edit_text("HWID пользователя для блокировки:")
+
+
+@router.message(S.a_block_hwid, F.text)
+async def a_block_hwid(msg: Message, state: FSMContext):
+    if not await get_user_by_hwid(msg.text.strip()):
+        await msg.answer("Не найдено.")
+        return
+    await state.update_data(hwid=msg.text.strip())
+    await state.set_state(S.a_block_dur)
+    await msg.answer("На сколько часов? (или напишите <b>inf</b> — навсегда)")
+
+
+@router.message(S.a_block_dur, F.text)
+async def a_block_dur(msg: Message, state: FSMContext):
+    t = msg.text.strip().lower()
+    if t == "inf":
+        until = INF_DATE
+    elif t.isdigit():
+        until = datetime.now(timezone.utc) + timedelta(hours=int(t))
+    else:
+        await msg.answer("Введите число или inf")
+        return
+    await state.update_data(until=until.isoformat())
+    await state.set_state(S.a_block_reason)
+    await msg.answer("Причина блокировки:")
+
+
+@router.message(S.a_block_reason, F.text)
+async def a_block_reason(msg: Message, state: FSMContext):
+    d = await state.get_data()
+    await db_exec("UPDATE users SET blocked_until=?, block_reason=? WHERE hwid=?",
+                  (d["until"], msg.text, d["hwid"]))
+    await state.clear()
+    await msg.answer("🚫 Заблокирован.", reply_markup=main_menu_kb(True))
+
+
+@router.callback_query(F.data == "a:block_off")
+async def a_block_off(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user):
+        return
+    await state.set_state(S.a_unblock_hwid)
+    await cb.message.edit_text("HWID для разблокировки:")
+
+
+@router.message(S.a_unblock_hwid, F.text)
+async def a_unblock(msg: Message, state: FSMContext):
+    hwid = msg.text.strip()
+    if not await get_user_by_hwid(hwid):
+        await msg.answer("Не найдено.")
+        return
+    await db_exec("UPDATE users SET blocked_until=NULL, block_reason=NULL WHERE hwid=?", (hwid,))
+    await state.clear()
+    await msg.answer("✅ Разблокирован.", reply_markup=main_menu_kb(True))
+
+
+# -------- TOKENS --------
+@router.callback_query(F.data == "a:tokens")
+async def a_tokens(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user):
+        return
+    await state.set_state(S.a_tokens_hwid)
+    await cb.message.edit_text("HWID пользователя:")
+
+
+@router.message(S.a_tokens_hwid, F.text)
+async def a_tokens_hwid(msg: Message, state: FSMContext):
+    u = await get_user_by_hwid(msg.text.strip())
+    if not u:
+        await msg.answer("Не найдено.")
+        return
+    await state.update_data(hwid=u["hwid"])
+    await state.set_state(S.a_tokens_act)
+    await msg.answer("Что сделать? <b>+</b> / <b>-</b>")
+
+
+@router.message(S.a_tokens_act, F.text)
+async def a_tokens_act(msg: Message, state: FSMContext):
+    if msg.text.strip() not in ("+", "-"):
+        await msg.answer("Введите + или -")
+        return
+    await state.update_data(act=msg.text.strip())
+    await state.set_state(S.a_tokens_amt)
+    await msg.answer("Сколько токенов? (или <b>inf</b>)")
+
+
+@router.message(S.a_tokens_amt, F.text)
+async def a_tokens_amt(msg: Message, state: FSMContext):
+    t = msg.text.strip().lower()
+    if t == "inf":
+        await state.update_data(amt=10**9, inf=True)
+    elif t.isdigit():
+        await state.update_data(amt=int(t), inf=False)
+    else:
+        await msg.answer("Число или inf")
+        return
+    await state.set_state(S.a_tokens_days)
+    await msg.answer("На сколько дней? (число или <b>inf</b>)")
+
+
+@router.message(S.a_tokens_days, F.text)
+async def a_tokens_days(msg: Message, state: FSMContext):
+    t = msg.text.strip().lower()
+    if t == "inf":
+        days = 9999
+    elif t.isdigit():
+        days = int(t)
+    else:
+        await msg.answer("Число или inf")
+        return
+
+    d = await state.get_data()
+    u = await get_user_by_hwid(d["hwid"])
+    amt = d["amt"]
+    new_val = u["tokens"] + amt if d["act"] == "+" else max(0, u["tokens"] - amt)
+    if new_val > 10**9:
+        new_val = 10**9
+    await db_exec("UPDATE users SET tokens=? WHERE hwid=?", (new_val, d["hwid"]))
+    await state.clear()
+    await msg.answer(f"✅ Токенов у пользователя: {new_val} (действует {days} дн.)",
+                     reply_markup=main_menu_kb(True))
+
+
+# -------- TOKEN LIMIT --------
+@router.callback_query(F.data == "a:limit")
+async def a_limit(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user):
+        return
+    await state.set_state(S.a_limit_hwid)
+    await cb.message.edit_text("HWID пользователя:")
+
+
+@router.message(S.a_limit_hwid, F.text)
+async def a_limit_hwid(msg: Message, state: FSMContext):
+    u = await get_user_by_hwid(msg.text.strip())
+    if not u:
+        await msg.answer("Не найдено.")
+        return
+    await state.update_data(hwid=u["hwid"])
+    await state.set_state(S.a_limit_amt)
+    await msg.answer("Сколько токенов — новый лимит?")
+
+
+@router.message(S.a_limit_amt, F.text)
+async def a_limit_amt(msg: Message, state: FSMContext):
+    if not msg.text.isdigit():
+        await msg.answer("Число.")
+        return
+    await state.update_data(amt=int(msg.text))
+    await state.set_state(S.a_limit_days)
+    await msg.answer("На сколько дней?")
+
+
+@router.message(S.a_limit_days, F.text)
+async def a_limit_days(msg: Message, state: FSMContext):
+    if not msg.text.isdigit():
+        await msg.answer("Число.")
+        return
+    d = await state.get_data()
+    until = datetime.now(timezone.utc) + timedelta(days=int(msg.text))
+    await db_exec("UPDATE users SET token_limit=?, token_limit_until=? WHERE hwid=?",
+                  (d["amt"], until.isoformat(), d["hwid"]))
+    await state.clear()
+    await msg.answer(f"✅ Лимит {d['amt']} установлен.", reply_markup=main_menu_kb(True))
+
+
+@router.callback_query(F.data == "a:back")
+async def a_back(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await cb.message.edit_text("⚙️ Админ-панель", reply_markup=admin_kb())
+
+
+# ================== BACKGROUND ==================
+async def daily_reset():
+    """Каждые сутки в 00:00 МСК — обнуляем токены до лимита."""
+    while True:
+        now = datetime.now(MSK)
+        nxt = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        await asyncio.sleep((nxt - now).total_seconds())
+        users = await db_fetchall("SELECT * FROM users")
+        for u in users:
+            limit = u["token_limit"]
+            until = parse_dt(u["token_limit_until"])
+            if until and until < datetime.now(timezone.utc):
+                limit = DEFAULT_TOKEN_LIMIT
+            await db_exec(
+                "UPDATE users SET tokens=?, token_limit=?, last_reset=? WHERE tg_id=?",
+                (limit, limit, datetime.now(MSK).date().isoformat(), u["tg_id"]),
+            )
+
+
+async def license_watcher():
+    """Каждую минуту проверяем истечение лицензий (оповещаем при следующем действии — здесь просто лог)."""
+    while True:
+        await asyncio.sleep(60)
+        # Логика оповещения реализована через check_access при любом действии.
+        # Здесь можно добавить рассылку, если нужно — оставлено пустым по умолчанию.
+
+
+# ================== MAIN ==================
+async def main():
+    await init_db()
+    asyncio.create_task(daily_reset())
+    asyncio.create_task(license_watcher())
+    print("🤖 Бот запущен")
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
